@@ -96,19 +96,16 @@ async def news(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         try:
             data = get_stock_news(ticker)
-
+            change = data["change"]
+            news_list = data["news"]
         except Exception as e:
+            change = "정보 없음"
             news_list = [f"뉴스 수집 실패: {e}"]
-
-        change = data["change"]
-        news_list = data["news"]
 
         message += f"🔥 {ticker} ({change})\n"
 
         for news in news_list:
             message += f"- {news}\n"
-
-        message += "\n"
 
         message += "\n"
 

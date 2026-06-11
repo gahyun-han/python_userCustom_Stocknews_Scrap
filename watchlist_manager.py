@@ -1,7 +1,8 @@
 import json
 import os
+from pathlib import Path
 
-WATCHLIST_FILE = "user_watchlist.json"
+WATCHLIST_FILE = Path(__file__).parent / "user_watchlist.json"
 
 
 def load_watchlists():
