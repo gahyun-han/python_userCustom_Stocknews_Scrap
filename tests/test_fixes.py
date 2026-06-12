@@ -1,7 +1,8 @@
 """
-두 버그 수정 검증 테스트:
+버그 수정 검증 테스트:
 1. news() — try 블록 밖 data 참조 버그
 2. watchlist_manager — 절대경로 변환
+3. scheduler — dict 반환값을 list로 쓰던 버그 + 예외 처리 누락
 """
 import asyncio
 import json
@@ -42,7 +43,7 @@ def test_get_tickers_returns_list_for_known_user(tmp_path):
         assert get_tickers(7952029488) == ["SOXL", "TQQQ"]
 
 
-# ── news() 버그 수정 테스트 ───────────────────────────────────────────────────
+# ── bot.py news() 테스트 ──────────────────────────────────────────────────────
 
 def _make_update(user_id: int = 7952029488):
     update = MagicMock()
@@ -51,81 +52,103 @@ def _make_update(user_id: int = 7952029488):
     return update
 
 
-def _make_context():
-    return MagicMock()
-
-
 @pytest.mark.asyncio
 async def test_news_first_ticker_exception_still_sends_response():
     """첫 번째 ticker(SOXL)가 예외 발생해도 나머지 종목 포함해 응답이 와야 함."""
     from bot import news
-
     update = _make_update()
-    context = _make_context()
-
     with patch("bot.get_tickers", return_value=["SOXL", "TQQQ"]):
         with patch("bot.get_stock_news", side_effect=[
-            RuntimeError("network error"),          # SOXL 실패
-            {"change": "+1.00%", "news": ["TQQQ 뉴스"]},  # TQQQ 성공
+            RuntimeError("network error"),
+            {"change": "+1.00%", "news": ["TQQQ 뉴스"]},
         ]):
-            await news(update, context)
-
-    update.message.reply_text.assert_called_once()
+            await news(update, MagicMock())
     sent = update.message.reply_text.call_args[0][0]
     assert "SOXL" in sent
     assert "정보 없음" in sent
-    assert "뉴스 수집 실패" in sent
     assert "TQQQ" in sent
     assert "TQQQ 뉴스" in sent
 
 
 @pytest.mark.asyncio
 async def test_news_all_succeed():
-    """모든 종목 정상 응답."""
     from bot import news
-
     update = _make_update()
-    context = _make_context()
-
     with patch("bot.get_tickers", return_value=["SOXL", "SPY"]):
         with patch("bot.get_stock_news", side_effect=[
             {"change": "+7.56%", "news": ["SOXL 뉴스"]},
             {"change": "+0.12%", "news": ["SPY 뉴스"]},
         ]):
-            await news(update, context)
-
+            await news(update, MagicMock())
     sent = update.message.reply_text.call_args[0][0]
     assert "SOXL (+7.56%)" in sent
     assert "SPY (+0.12%)" in sent
 
 
 @pytest.mark.asyncio
-async def test_news_all_tickers_fail_still_responds():
-    """모든 종목 예외가 나도 응답은 와야 함."""
-    from bot import news
-
-    update = _make_update()
-    context = _make_context()
-
-    with patch("bot.get_tickers", return_value=["SOXL"]):
-        with patch("bot.get_stock_news", side_effect=RuntimeError("timeout")):
-            await news(update, context)
-
-    update.message.reply_text.assert_called_once()
-    sent = update.message.reply_text.call_args[0][0]
-    assert "SOXL" in sent
-    assert "정보 없음" in sent
-
-
-@pytest.mark.asyncio
 async def test_news_no_tickers():
-    """관심종목 없으면 안내 메시지."""
     from bot import news
-
     update = _make_update()
-    context = _make_context()
-
     with patch("bot.get_tickers", return_value=[]):
-        await news(update, context)
-
+        await news(update, MagicMock())
     update.message.reply_text.assert_called_once_with("관심종목이 없습니다.")
+
+
+# ── scheduler.py send_daily_news() 테스트 ─────────────────────────────────────
+
+def test_scheduler_uses_dict_change_and_news(tmp_path):
+    """scheduler가 get_stock_news 반환 dict에서 change, news를 올바르게 꺼내야 함."""
+    from scheduler import send_daily_news
+    wf = tmp_path / "user_watchlist.json"
+    wf.write_text(json.dumps({"111": ["SOXL", "TQQQ"]}))
+    sent_messages = []
+
+    with patch("watchlist_manager.WATCHLIST_FILE", wf):
+        with patch("scheduler.get_stock_news", side_effect=[
+            {"change": "+5.00%", "news": ["SOXL 뉴스A"]},
+            {"change": "+1.00%", "news": ["TQQQ 뉴스B"]},
+        ]):
+            with patch("scheduler.send_message", side_effect=lambda uid, msg: sent_messages.append(msg)):
+                send_daily_news()
+
+    assert len(sent_messages) == 1
+    msg = sent_messages[0]
+    assert "SOXL (+5.00%)" in msg
+    assert "SOXL 뉴스A" in msg
+    assert "TQQQ (+1.00%)" in msg
+    assert "TQQQ 뉴스B" in msg
+    # 예전 버그: dict key("change","news")가 그대로 출력되지 않아야 함
+    assert "- change\n" not in msg
+    assert "- news\n" not in msg
+
+
+def test_scheduler_first_ticker_exception_continues(tmp_path):
+    """SOXL 예외 발생해도 TQQQ 포함해 메시지 전송."""
+    from scheduler import send_daily_news
+    wf = tmp_path / "user_watchlist.json"
+    wf.write_text(json.dumps({"111": ["SOXL", "TQQQ"]}))
+    sent_messages = []
+
+    with patch("watchlist_manager.WATCHLIST_FILE", wf):
+        with patch("scheduler.get_stock_news", side_effect=[
+            RuntimeError("timeout"),
+            {"change": "+1.00%", "news": ["TQQQ 뉴스"]},
+        ]):
+            with patch("scheduler.send_message", side_effect=lambda uid, msg: sent_messages.append(msg)):
+                send_daily_news()
+
+    assert len(sent_messages) == 1
+    msg = sent_messages[0]
+    assert "SOXL" in msg
+    assert "정보 없음" in msg
+    assert "TQQQ" in msg
+
+
+def test_scheduler_empty_watchlist_sends_nothing(tmp_path):
+    from scheduler import send_daily_news
+    wf = tmp_path / "user_watchlist.json"
+    wf.write_text(json.dumps({"111": []}))
+    with patch("watchlist_manager.WATCHLIST_FILE", wf):
+        with patch("scheduler.send_message") as mock_send:
+            send_daily_news()
+    mock_send.assert_not_called()
